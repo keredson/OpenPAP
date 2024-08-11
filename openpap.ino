@@ -10,7 +10,7 @@
 #include <NetworkUdp.h>
 #include <ArduinoOTA.h>
 
-
+#include "peer.h"
 
 
 // Define the pins for KY-040 rotary encoder
@@ -105,7 +105,7 @@ class PID {
 
 };
 
-double pressure = 70; // mmH2O
+double pressure = 90; // mmH2O
 
 void esc_setup() {
   display.println("Init ESC...");
@@ -331,6 +331,123 @@ void setup_ota() {
   ArduinoOTA.begin();
 }
 
+PeerConnection *g_pc;
+PeerConnectionState eState = PEER_CONNECTION_CLOSED;
+int gDataChannelOpened = 0;
+static TaskHandle_t xPcTaskHandle = NULL;
+static TaskHandle_t xCameraTaskHandle = NULL;
+static TaskHandle_t xPsTaskHandle = NULL;
+
+
+int64_t get_timestamp() {
+
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (tv.tv_sec * 1000LL + (tv.tv_usec / 1000LL));
+}
+
+static void oniceconnectionstatechange(PeerConnectionState state, void *user_data) {
+
+  ESP_LOGI(TAG, "PeerConnectionState: %d", state);
+  eState = state;
+  // not support datachannel close event
+  if (eState != PEER_CONNECTION_COMPLETED) {
+    gDataChannelOpened = 0;
+  }
+}
+
+static void onmessage(char *msg, size_t len, void *userdata, uint16_t sid) {
+
+  ESP_LOGI(TAG, "Datachannel message: %.*s, size", len, msg);
+}
+
+void onopen(void *userdata) {
+ 
+  ESP_LOGI(TAG, "Datachannel opened");
+  gDataChannelOpened = 1;
+}
+
+static void onclose(void *userdata) {
+}
+
+void peer_signaling_task(void *arg) {
+
+  ESP_LOGI(TAG, "peer_signaling_task started");
+
+  for(;;) {
+
+    peer_signaling_loop();
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+
+}
+
+void peer_connection_task(void *arg) {
+
+  ESP_LOGI(TAG, "peer_connection_task started");
+
+  for(;;) {
+
+    peer_connection_loop(g_pc);
+
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+}
+
+void setup_webrtc() {
+  static char deviceid[32] = {0};
+  uint32_t chipId = 0;
+  for (int i = 0; i < 17; i = i + 8) {
+    chipId |= ((ESP.getEfuseMac() >> (40 - i)) & 0xff) << i;
+  }
+  snprintf(deviceid,32, "OpenPAP-%08X",chipId);
+
+  PeerConfiguration config = {
+   .ice_servers = {
+    { .urls = "stun:stun.l.google.com:19302" }
+   },
+   .datachannel = DATA_CHANNEL_BINARY,
+  };
+
+  ESP_LOGI(TAG, "[APP] Startup..");
+  ESP_LOGI(TAG, "[APP] Free memory: %d bytes", esp_get_free_heap_size());
+  ESP_LOGI(TAG, "[APP] IDF version: %s", esp_get_idf_version());
+
+  esp_log_level_set("*", ESP_LOG_INFO);
+  esp_log_level_set("esp-tls", ESP_LOG_VERBOSE);
+  esp_log_level_set("MQTT_CLIENT", ESP_LOG_VERBOSE);
+  esp_log_level_set("MQTT_EXAMPLE", ESP_LOG_VERBOSE);
+  esp_log_level_set("TRANSPORT_BASE", ESP_LOG_VERBOSE);
+  esp_log_level_set("TRANSPORT", ESP_LOG_VERBOSE);
+  esp_log_level_set("OUTBOX", ESP_LOG_VERBOSE);
+
+//  ESP_ERROR_CHECK(nvs_flash_init());
+//  ESP_ERROR_CHECK(esp_netif_init());
+//  ESP_ERROR_CHECK(esp_event_loop_create_default());
+//  ESP_ERROR_CHECK(mdns_init());
+//  ESP_ERROR_CHECK(example_connect());
+
+  ESP_LOGI(TAG, "Device ID: %s", deviceid);
+
+  peer_init();
+
+  g_pc = peer_connection_create(&config);
+  peer_connection_oniceconnectionstatechange(g_pc, oniceconnectionstatechange);
+  peer_connection_ondatachannel(g_pc, onmessage, onopen, onclose);
+
+  peer_signaling_join_channel(deviceid, g_pc);
+
+  xTaskCreatePinnedToCore(peer_connection_task, "peer_connection", 8192, NULL, 10, &xPcTaskHandle, 1);
+
+  xTaskCreatePinnedToCore(peer_signaling_task, "peer_signaling", 8192, NULL, 10, &xPsTaskHandle, 0);
+
+  ESP_LOGI(TAG, "[APP] Free memory: %d bytes", esp_get_free_heap_size());
+  ESP_LOGI(TAG, "open https://sepfy.github.io/webrtc?deviceId=%s", deviceid);
+
+}
+
+
 void setup() {
   Serial.begin(115200);
 
@@ -344,6 +461,8 @@ void setup() {
   setup_button();
 
   setup_wifi();
+
+  setup_webrtc();
 
   display.clearDisplay();
   display.setCursor(0, 0);

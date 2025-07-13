@@ -1,16 +1,15 @@
 /*
- * ESP32 Dual DS18B20 Temperature Monitor with Web Server, OTA, and Pump Control
+ * ESP32 Dual DS18B20 Temperature Monitor with Web Server, OTA, and PID Pump Control
  * * This sketch reads temperature from two DS18B20 sensors, displays it on an 
  * SSD1306 OLED display, and hosts a web page to show a graph of the 
- * temperature history and control a PWM pump. It also allows downloading the data as a CSV file.
+ * temperature history and control a pump via a PID controller.
  *
  * Features:
  * - WiFiManager for easy WiFi configuration.
  * - Over-the-Air (OTA) updates for wireless flashing.
- * - SSD1306 128x64 OLED display support.
- * - Reads from two DS18B20 temperature sensors on a single pin.
- * - PWM pump control via a web UI slider.
- * - Stores temperature readings in memory.
+ * - PID controller to automatically manage pump power based on a target temperature.
+ * - Web UI to set target temperature and view pump power on the graph.
+ * - Stores temperature readings and pump power in memory.
  * - Web server with a graphical chart and CSV download functionality.
  *
  * Hardware:
@@ -35,6 +34,7 @@
  * - DallasTemperature by Miles Burton
  * - Adafruit SSD1306 by Adafruit
  * - Adafruit GFX Library by Adafruit
+ * - PID by Brett Beauregard (PID_v1)
  */
 
 // --- Library Includes ---
@@ -48,16 +48,22 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <PID_v1.h>
 
 // --- Pin Definitions ---
 #define ONE_WIRE_BUS 14 // GPIO for DS18B20 sensors
 #define PUMP_PIN 13     // GPIO for PWM Pump Control
 
 // --- PWM Configuration ---
-// const int PUMP_PWM_CHANNEL = 0; // Channel is no longer managed manually in ESP32 Core v3+
 const int PUMP_PWM_FREQ = 5000;
 const int PUMP_PWM_RESOLUTION = 8; // 8-bit resolution (0-255)
-int pumpSpeed = 0; // Current pump speed (0-100%)
+
+// --- PID Controller Configuration ---
+double Setpoint, Input, Output;
+// Tuning parameters - these may need to be adjusted for your specific setup
+double Kp=5, Ki=0.1, Kd=1; 
+// Use REVERSE for cooling applications. Output increases as Input rises above Setpoint.
+PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, REVERSE);
 
 // --- Display Configuration ---
 #define SCREEN_WIDTH 128
@@ -78,9 +84,13 @@ struct TempReading {
   unsigned long time;
   float temp1;
   float temp2;
+  float pumpPower; // Use float instead of double to save memory
 };
 
-#define MAX_READINGS 6000 // Store up to 6000 readings
+// NOTE: 6000 readings is too large for the ESP32's RAM. 
+// Reduced to 1800 to prevent memory overflow errors during compilation.
+// This still provides over 2 hours of history at a 5-second interval.
+#define MAX_READINGS 4000 
 TempReading data[MAX_READINGS];
 int readingCount = 0;
 
@@ -94,7 +104,7 @@ void setupWebServer();
 void readTemperatures();
 void updateDisplay();
 void handleRoot();
-void handlePumpControl();
+void handleSetpointControl();
 void handleDataJson();
 void handleDownloadCsv();
 void handleNotFound();
@@ -106,10 +116,13 @@ void setup() {
   Serial.begin(115200);
 
   // --- Setup Pump PWM for ESP32 Core v3.x+ ---
-  // ledcSetup is removed. Configuration is now done in ledcAttach.
-  // The channel is managed internally by the pin number.
   ledcAttach(PUMP_PIN, PUMP_PWM_FREQ, PUMP_PWM_RESOLUTION);
-  ledcWrite(PUMP_PIN, 0); // Start with pump off. Use Pin number directly.
+  ledcWrite(PUMP_PIN, 0); // Start with pump off
+
+  // --- Initialize PID Controller ---
+  Setpoint = 78.0; // Default target temperature
+  myPID.SetOutputLimits(0, 255); // PID output will be scaled to PWM duty cycle range
+  myPID.SetMode(AUTOMATIC);
 
   // Initialize display
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
@@ -167,7 +180,7 @@ void setup() {
   // Setup OTA, Web Server, and initial temp reading
   setupOTA();
   setupWebServer();
-  readTemperatures();
+  readTemperatures(); // Get initial reading
   updateDisplay();
 }
 
@@ -181,6 +194,13 @@ void loop() {
     lastTempRead = currentMillis;
     readTemperatures();
     updateDisplay();
+  }
+
+  // Update PID controller continuously
+  if (readingCount > 0) {
+    Input = data[readingCount-1].temp1; // PID input is the latest temp from sensor 1
+    myPID.Compute();
+    ledcWrite(PUMP_PIN, Output); // PID output directly drives the pump PWM
   }
 }
 
@@ -225,7 +245,7 @@ void setupOTA() {
 }
 
 /**
- * @brief Reads temperatures from both DS18B20 sensors and stores them.
+ * @brief Reads temperatures and stores them along with current pump power.
  */
 void readTemperatures() {
   sensors.requestTemperatures(); 
@@ -241,6 +261,7 @@ void readTemperatures() {
     data[readingCount].time = millis() / 1000;
     data[readingCount].temp1 = tempC1;
     data[readingCount].temp2 = tempC2;
+    data[readingCount].pumpPower = (Output / 255.0) * 100.0; // Store pump power as percentage
     readingCount++;
   } else {
     // Shift all data left to make space for the new reading
@@ -250,10 +271,12 @@ void readTemperatures() {
     data[MAX_READINGS - 1].time = millis() / 1000;
     data[MAX_READINGS - 1].temp1 = tempC1;
     data[MAX_READINGS - 1].temp2 = tempC2;
+    data[MAX_READINGS - 1].pumpPower = (Output / 255.0) * 100.0; // Store pump power as percentage
   }
   
-  Serial.print("Sensor 1: "); Serial.print(tempC1); Serial.println(" *C");
-  Serial.print("Sensor 2: "); Serial.print(tempC2); Serial.println(" *C");
+  Serial.print("Sensor 1: "); Serial.print(tempC1); Serial.print(" *C, ");
+  Serial.print("Sensor 2: "); Serial.print(tempC2); Serial.print(" *C, ");
+  Serial.print("Pump Power: "); Serial.print(data[readingCount-1].pumpPower); Serial.println("%");
 }
 
 /**
@@ -262,22 +285,24 @@ void readTemperatures() {
 void updateDisplay() {
   display.clearDisplay();
   display.setCursor(0,0);
-  display.println("Temp Monitor");
-  display.println("------------");
+  display.println("PID Temp Control");
+  display.println("----------------");
   
   if (readingCount > 0) {
     display.print("S1: ");
-    display.print(data[readingCount-1].temp1);
-    display.println(" C");
+    display.print(data[readingCount-1].temp1, 1);
+    display.print("/");
+    display.print(Setpoint, 1);
+    display.println("C");
 
-    display.print("S2: ");
-    display.print(data[readingCount-1].temp2);
-    display.println(" C");
+    display.print("Pump: ");
+    display.print(data[readingCount-1].pumpPower, 0);
+    display.println("%");
   } else {
     display.println("No readings yet.");
   }
   
-  display.println("------------");
+  display.println("----------------");
   display.println(WiFi.localIP());
   display.display();
 }
@@ -287,7 +312,7 @@ void updateDisplay() {
  */
 void setupWebServer() {
   server.on("/", HTTP_GET, handleRoot);
-  server.on("/pump", HTTP_POST, handlePumpControl);
+  server.on("/setpoint", HTTP_POST, handleSetpointControl);
   server.on("/data.json", HTTP_GET, handleDataJson);
   server.on("/download.csv", HTTP_GET, handleDownloadCsv);
   server.onNotFound(handleNotFound);
@@ -304,7 +329,7 @@ void handleRoot() {
 <!DOCTYPE html>
 <html>
 <head>
-  <title>ESP32 Temp Monitor</title>
+  <title>ESP32 PID Controller</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
@@ -340,14 +365,14 @@ void handleRoot() {
       padding: 15px 0;
       border-top: 1px solid #eee;
     }
-    .pump-control {
+    .setpoint-control {
       margin-bottom: 15px;
     }
-    .pump-control label {
+    .setpoint-control label {
       font-size: 18px;
       margin-right: 10px;
     }
-    .pump-control input[type="range"] {
+    .setpoint-control input[type="range"] {
       width: 50%;
       max-width: 300px;
       vertical-align: middle;
@@ -369,16 +394,16 @@ void handleRoot() {
 </head>
 <body>
   <div class="container">
-    <h1>ESP32 Temperature & Pump Control</h1>
+    <h1>ESP32 PID Temperature Control</h1>
     <div id="chart-container">
       <canvas id="tempChart"></canvas>
     </div>
     <div class="controls-container">
-      <div class="pump-control">
-        <label for="pumpSlider">Pump Speed: <span id="pumpSpeedLabel">0</span>%</label>
-        <input type="range" min="0" max="100" value="0" id="pumpSlider">
+      <div class="setpoint-control">
+        <label for="setpointSlider">Target Temp: <span id="setpointLabel">78.0</span> &deg;C</label>
+        <input type="range" min="20" max="100" value="78" step="0.1" id="setpointSlider">
       </div>
-      <a href="/download.csv" class="button">Download Temp CSV</a>
+      <a href="/download.csv" class="button">Download Data CSV</a>
     </div>
   </div>
   <script>
@@ -402,6 +427,7 @@ void handleRoot() {
           myChart.data.labels = labels;
           myChart.data.datasets[0].data = data.map(d => d.temp1);
           myChart.data.datasets[1].data = data.map(d => d.temp2);
+          myChart.data.datasets[2].data = data.map(d => d.pumpPower);
           myChart.update();
         } else {
           // If chart doesn't exist, create it
@@ -413,37 +439,42 @@ void handleRoot() {
                 label: 'Sensor 1 (°C)',
                 data: data.map(d => d.temp1),
                 borderColor: 'rgba(255, 99, 132, 1)',
-                backgroundColor: 'rgba(255, 99, 132, 0.2)',
-                fill: false,
-                borderWidth: 2
+                yAxisID: 'y-temp',
+                fill: false
               }, {
                 label: 'Sensor 2 (°C)',
                 data: data.map(d => d.temp2),
                 borderColor: 'rgba(54, 162, 235, 1)',
-                backgroundColor: 'rgba(54, 162, 235, 0.2)',
-                fill: false,
-                borderWidth: 2
+                yAxisID: 'y-temp',
+                fill: false
+              }, {
+                label: 'Pump Power (%)',
+                data: data.map(d => d.pumpPower),
+                borderColor: 'rgba(75, 192, 192, 1)',
+                backgroundColor: 'rgba(75, 192, 192, 0.2)',
+                yAxisID: 'y-power',
+                fill: true
               }]
             },
             options: {
               responsive: true,
               maintainAspectRatio: false,
               scales: {
-                x: {
+                x: { display: true, title: { display: true, text: 'Time' } },
+                'y-temp': {
+                  type: 'linear',
                   display: true,
-                  title: {
-                    display: true,
-                    text: 'Time'
-                  }
+                  position: 'left',
+                  title: { display: true, text: 'Temperature (°C)' }
                 },
-                y: {
+                'y-power': {
+                  type: 'linear',
                   display: true,
-                  title: {
-                    display: true,
-                    text: 'Temperature (°C)'
-                  },
-                  //min: 70,  // Set minimum Y-axis value
-                  //max: 100  // Set maximum Y-axis value
+                  position: 'right',
+                  min: 0,
+                  max: 100,
+                  title: { display: true, text: 'Pump Power (%)' },
+                  grid: { drawOnChartArea: false }
                 }
               }
             }
@@ -452,21 +483,21 @@ void handleRoot() {
       }).catch(error => console.error('Chart update error:', error));
     };
 
-    // --- Pump Control Logic ---
-    const pumpSlider = document.getElementById('pumpSlider');
-    const pumpSpeedLabel = document.getElementById('pumpSpeedLabel');
+    // --- Setpoint Control Logic ---
+    const setpointSlider = document.getElementById('setpointSlider');
+    const setpointLabel = document.getElementById('setpointLabel');
 
-    pumpSlider.addEventListener('input', (event) => {
-      const speed = event.target.value;
-      pumpSpeedLabel.textContent = speed;
+    setpointSlider.addEventListener('input', (event) => {
+      const temp = parseFloat(event.target.value).toFixed(1);
+      setpointLabel.textContent = temp;
     });
 
-    pumpSlider.addEventListener('change', (event) => {
-      const speed = event.target.value;
+    setpointSlider.addEventListener('change', (event) => {
+      const temp = event.target.value;
       const formData = new FormData();
-      formData.append('speed', speed);
+      formData.append('target', temp);
 
-      fetch('/pump', {
+      fetch('/setpoint', {
         method: 'POST',
         body: new URLSearchParams(formData)
       });
@@ -483,34 +514,25 @@ void handleRoot() {
 }
 
 /**
- * @brief Handles POST requests to control the pump speed.
+ * @brief Handles POST requests to update the PID setpoint.
  */
-void handlePumpControl() {
-  if (server.hasArg("speed")) {
-    String speedStr = server.arg("speed");
-    pumpSpeed = speedStr.toInt();
+void handleSetpointControl() {
+  if (server.hasArg("target")) {
+    String targetStr = server.arg("target");
+    Setpoint = targetStr.toDouble();
     
-    // Map the 0-100% speed to the 8-bit PWM resolution (0-255)
-    int dutyCycle = map(pumpSpeed, 0, 100, 0, 255);
-    
-    // Use the pin number directly for ledcWrite in ESP32 Core v3.x+
-    ledcWrite(PUMP_PIN, dutyCycle);
-    
-    Serial.print("Pump speed set to: ");
-    Serial.print(pumpSpeed);
-    Serial.print("% (Duty Cycle: ");
-    Serial.print(dutyCycle);
-    Serial.println(")");
+    Serial.print("New Setpoint received: ");
+    Serial.println(Setpoint);
     
     server.send(200, "text/plain", "OK");
   } else {
-    server.send(400, "text/plain", "Bad Request: 'speed' parameter missing");
+    server.send(400, "text/plain", "Bad Request: 'target' parameter missing");
   }
 }
 
 
 /**
- * @brief Serves the temperature data as a JSON object by streaming it.
+ * @brief Serves the temperature and pump data as a JSON object by streaming it.
  */
 void handleDataJson() {
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
@@ -522,6 +544,7 @@ void handleDataJson() {
     json_item += "\"time\":" + String(data[i].time);
     json_item += ",\"temp1\":" + String(data[i].temp1);
     json_item += ",\"temp2\":" + String(data[i].temp2);
+    json_item += ",\"pumpPower\":" + String(data[i].pumpPower);
     json_item += "}";
     if (i < readingCount - 1) {
       json_item += ",";
@@ -541,9 +564,9 @@ void handleDownloadCsv() {
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/csv", ""); // Send headers
 
-  server.sendContent("Time,Sensor1_C,Sensor2_C\n");
+  server.sendContent("Time,Sensor1_C,Sensor2_C,PumpPower_%\n");
   for (int i = 0; i < readingCount; i++) {
-    String row = String(data[i].time) + "," + String(data[i].temp1) + "," + String(data[i].temp2) + "\n";
+    String row = String(data[i].time) + "," + String(data[i].temp1) + "," + String(data[i].temp2) + "," + String(data[i].pumpPower) + "\n";
     server.sendContent(row);
   }
 

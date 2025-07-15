@@ -1,23 +1,26 @@
 /*
  * ESP32 Dual DS18B20 Temperature Monitor with Web Server, OTA, and PID Pump Control
- * * This sketch reads temperature from two DS18B20 sensors, displays it on an 
- * SSD1306 OLED display, and hosts a web page to show a graph of the 
- * temperature history and control a pump via a PID controller.
+ * * This sketch reads temperature from two DS18B20 sensors, pressure from an
+ * HX711, displays it on an SSD1306 OLED display, and hosts a web page to 
+ * show a graph of the history and control a pump via a PID controller.
  *
  * Features:
  * - WiFiManager for easy WiFi configuration.
  * - Over-the-Air (OTA) updates for wireless flashing.
  * - PID controller to automatically manage pump power based on a target temperature.
- * - Web UI to set target temperature and view pump power on the graph.
- * - Stores temperature readings and pump power in memory.
+ * - Web UI to set target temperature, PID tunings, and pump mode (Off/Auto/Manual).
+ * - Reads from DS18B20 temperature sensors and an HX711 pressure sensor.
+ * - Compensates for known pressure sensor drift.
+ * - Stores sensor data in memory.
  * - Web server with a graphical chart and CSV download functionality.
  *
  * Hardware:
  * - ESP32 development board
  * - SSD1306 OLED Display (I2C)
  * - 2 x DS18B20 temperature sensors
+ * - HX711 Load Cell Amplifier
  * - 4.7k Ohm pull-up resistor for the DS18B20 data line
- * - A logic-level MOSFET or motor driver to control the pump.
+ * - A logic-level MOSFET or motor driver to control the pump with a flyback diode.
  *
  * Wiring:
  * - SSD1306 SDA -> GPIO 21 (I2C SDA)
@@ -26,7 +29,9 @@
  * - DS18B20 VCC -> 3.3V
  * - DS18B20 GND -> GND
  * - Connect a 4.7k Ohm resistor between DS18B20 Data (GPIO 14) and 3.3V.
- * - Pump Control (e.g., MOSFET Gate) -> GPIO 13
+ * - Pump Control (e.g., MOSFET Gate) -> GPIO 27
+ * - HX711 DOUT -> GPIO 25
+ * - HX711 SCK  -> GPIO 26
  *
  * Libraries to install via Arduino Library Manager:
  * - WiFiManager by tzapu
@@ -35,6 +40,7 @@
  * - Adafruit SSD1306 by Adafruit
  * - Adafruit GFX Library by Adafruit
  * - PID by Brett Beauregard (PID_v1)
+ * - HX711 by bodge
  */
 
 // --- Library Includes ---
@@ -49,14 +55,22 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <PID_v1.h>
+#include "HX711.h"
 
 // --- Pin Definitions ---
 #define ONE_WIRE_BUS 14 // GPIO for DS18B20 sensors
-#define PUMP_PIN 13     // GPIO for PWM Pump Control
+#define PUMP_PIN 27     // GPIO for PWM Pump Control
+#define HX711_DOUT 25
+#define HX711_SCK  26
 
 // --- PWM Configuration ---
 const int PUMP_PWM_FREQ = 5000;
 const int PUMP_PWM_RESOLUTION = 8; // 8-bit resolution (0-255)
+
+// --- Pump Control State ---
+enum PumpMode { PUMP_OFF, PUMP_AUTO, PUMP_MANUAL };
+PumpMode currentPumpMode = PUMP_AUTO; // Default to automatic PID control
+int manualPumpPower = 0; // Manual power setting (0-100%)
 
 // --- PID Controller Configuration ---
 double Setpoint, Input, Output;
@@ -65,46 +79,51 @@ double Kp=5, Ki=0.1, Kd=1;
 // Use REVERSE for cooling applications. Output increases as Input rises above Setpoint.
 PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, REVERSE);
 
+// --- Sensor Configuration ---
+HX711 scale;
+const float PRESSURE_DRIFT_PER_MINUTE = 0.12;
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+DeviceAddress sensor1Address, sensor2Address;
+
 // --- Display Configuration ---
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-
-// --- Sensor Configuration ---
-OneWire oneWire(ONE_WIRE_BUS);
-DallasTemperature sensors(&oneWire);
-DeviceAddress sensor1Address, sensor2Address;
 
 // --- Web Server and WiFi ---
 WebServer server(80); // Standard WebServer instance
 WiFiManager wm;
 
 // --- Data Storage ---
-struct TempReading {
+struct SensorReading {
   unsigned long time;
   float temp1;
   float temp2;
-  float pumpPower; // Use float instead of double to save memory
+  float pumpPower;
+  float pressure;
 };
 
-// NOTE: 6000 readings is too large for the ESP32's RAM. 
-// Reduced to 1800 to prevent memory overflow errors during compilation.
-// This still provides over 2 hours of history at a 5-second interval.
-#define MAX_READINGS 4000 
-TempReading data[MAX_READINGS];
+#define MAX_READINGS 3000 
+SensorReading data[MAX_READINGS];
 int readingCount = 0;
 
 // --- Timing ---
-unsigned long lastTempRead = 0;
-const long tempReadInterval = 5000; // 5 seconds
+unsigned long lastSensorRead = 0;
+const long sensorReadInterval = 5000; // 5 seconds
 
 // --- Function Prototypes ---
 void setupOTA();
 void setupWebServer();
-void readTemperatures();
+void readSensors();
 void updateDisplay();
 void handleRoot();
 void handleSetpointControl();
+void handlePidControl();
+void handleGetPid();
+void handlePumpModeControl();
+void handleGetPumpMode();
+void handleManualPumpControl();
 void handleDataJson();
 void handleDownloadCsv();
 void handleNotFound();
@@ -140,7 +159,7 @@ void setup() {
 
   // Initialize sensors and print their addresses
   sensors.begin();
-  Serial.println("Locating sensors...");
+  Serial.println("Locating temp sensors...");
   if (sensors.getAddress(sensor1Address, 0)) {
     Serial.print("Sensor 1 Address: ");
     Serial.println(getSensorAddressString(sensor1Address));
@@ -154,6 +173,15 @@ void setup() {
   } else {
     Serial.println("Unable to find address for Sensor 2");
   }
+  
+  // Initialize HX711
+  Serial.println("Initializing pressure sensor...");
+  scale.begin(HX711_DOUT, HX711_SCK);
+  // You need to calibrate your HX711 and set the scale factor.
+  // This value is arbitrary and must be replaced.
+  // See HX711 library examples for calibration sketches.
+  scale.set_scale(2280.f); 
+  scale.tare(); // Assume the initial reading is 0 pressure.
 
   // WiFiManager setup
   WiFi.mode(WIFI_STA);
@@ -177,10 +205,10 @@ void setup() {
       display.display();
   }
 
-  // Setup OTA, Web Server, and initial temp reading
+  // Setup OTA, Web Server, and initial sensor reading
   setupOTA();
   setupWebServer();
-  readTemperatures(); // Get initial reading
+  readSensors(); // Get initial reading
   updateDisplay();
 }
 
@@ -190,18 +218,33 @@ void loop() {
   server.handleClient(); // Handle incoming web server requests
 
   unsigned long currentMillis = millis();
-  if (currentMillis - lastTempRead >= tempReadInterval) {
-    lastTempRead = currentMillis;
-    readTemperatures();
+  if (currentMillis - lastSensorRead >= sensorReadInterval) {
+    lastSensorRead = currentMillis;
+    readSensors();
     updateDisplay();
   }
 
-  // Update PID controller continuously
-  if (readingCount > 0) {
-    Input = data[readingCount-1].temp1; // PID input is the latest temp from sensor 1
-    myPID.Compute();
-    ledcWrite(PUMP_PIN, Output); // PID output directly drives the pump PWM
+  // --- Main Pump Control Logic ---
+  int pumpDutyCycle = 0;
+  switch(currentPumpMode) {
+    case PUMP_AUTO:
+      if (readingCount > 0) {
+        Input = data[readingCount-1].temp1; // PID input is the latest temp from sensor 1
+        myPID.Compute();
+        if (Output > 1) { // Leave a small deadband to ensure pump is fully off
+          pumpDutyCycle = map(Output, 1, 255, 80, 255);
+        }
+      }
+      break;
+    case PUMP_MANUAL:
+      pumpDutyCycle = map(manualPumpPower, 0, 100, 0, 255);
+      break;
+    case PUMP_OFF:
+    default:
+      pumpDutyCycle = 0; // Off
+      break;
   }
+  ledcWrite(PUMP_PIN, pumpDutyCycle);
 }
 
 // --- Function Implementations ---
@@ -245,9 +288,10 @@ void setupOTA() {
 }
 
 /**
- * @brief Reads temperatures and stores them along with current pump power.
+ * @brief Reads all sensors and stores the data.
  */
-void readTemperatures() {
+void readSensors() {
+  // Read Temperatures
   sensors.requestTemperatures(); 
   float tempC1 = sensors.getTempC(sensor1Address);
   float tempC2 = sensors.getTempC(sensor2Address);
@@ -256,12 +300,41 @@ void readTemperatures() {
     Serial.println("Error: Could not read temperature data");
     return;
   }
+  
+  // Read Pressure and apply drift compensation
+  float pressure = 0;
+  if (scale.is_ready()) {
+    float rawPressure = scale.get_units(5); // Get an average of 5 readings
+    float elapsedMinutes = millis() / 60000.0;
+    float driftCorrection = elapsedMinutes * PRESSURE_DRIFT_PER_MINUTE;
+    pressure = rawPressure - driftCorrection;
+  } else {
+    Serial.println("HX711 not found.");
+  }
+
+  // Calculate the actual pump duty cycle
+  int pumpDutyCycle = 0;
+  switch(currentPumpMode) {
+    case PUMP_AUTO:
+      if (Output > 1) {
+        pumpDutyCycle = map(Output, 1, 255, 80, 255);
+      }
+      break;
+    case PUMP_MANUAL:
+      pumpDutyCycle = map(manualPumpPower, 0, 100, 0, 255);
+      break;
+    case PUMP_OFF:
+    default:
+      pumpDutyCycle = 0;
+      break;
+  }
 
   if (readingCount < MAX_READINGS) {
     data[readingCount].time = millis() / 1000;
     data[readingCount].temp1 = tempC1;
     data[readingCount].temp2 = tempC2;
-    data[readingCount].pumpPower = (Output / 255.0) * 100.0; // Store pump power as percentage
+    data[readingCount].pressure = pressure;
+    data[readingCount].pumpPower = (pumpDutyCycle / 255.0) * 100.0;
     readingCount++;
   } else {
     // Shift all data left to make space for the new reading
@@ -271,22 +344,26 @@ void readTemperatures() {
     data[MAX_READINGS - 1].time = millis() / 1000;
     data[MAX_READINGS - 1].temp1 = tempC1;
     data[MAX_READINGS - 1].temp2 = tempC2;
-    data[MAX_READINGS - 1].pumpPower = (Output / 255.0) * 100.0; // Store pump power as percentage
+    data[MAX_READINGS - 1].pressure = pressure;
+    data[MAX_READINGS - 1].pumpPower = (pumpDutyCycle / 255.0) * 100.0;
   }
   
-  Serial.print("Sensor 1: "); Serial.print(tempC1); Serial.print(" *C, ");
-  Serial.print("Sensor 2: "); Serial.print(tempC2); Serial.print(" *C, ");
-  Serial.print("Pump Power: "); Serial.print(data[readingCount-1].pumpPower); Serial.println("%");
+  Serial.print("S1: "); Serial.print(tempC1); Serial.print("C, S2: "); Serial.print(tempC2); Serial.print("C, Pressure: "); Serial.print(pressure);
+  Serial.print(", Pump: "); Serial.print(data[readingCount-1].pumpPower); Serial.println("%");
 }
 
 /**
- * @brief Updates the OLED display with the latest temperature readings.
+ * @brief Updates the OLED display with the latest sensor readings.
  */
 void updateDisplay() {
   display.clearDisplay();
   display.setCursor(0,0);
-  display.println("PID Temp Control");
-  display.println("----------------");
+  
+  switch(currentPumpMode) {
+    case PUMP_AUTO: display.println("Mode: Auto"); break;
+    case PUMP_MANUAL: display.println("Mode: Manual"); break;
+    case PUMP_OFF:  display.println("Mode: Off");  break;
+  }
   
   if (readingCount > 0) {
     display.print("S1: ");
@@ -298,11 +375,13 @@ void updateDisplay() {
     display.print("Pump: ");
     display.print(data[readingCount-1].pumpPower, 0);
     display.println("%");
+
+    display.print("Pres: ");
+    display.println(data[readingCount-1].pressure, 2);
   } else {
     display.println("No readings yet.");
   }
   
-  display.println("----------------");
   display.println(WiFi.localIP());
   display.display();
 }
@@ -313,6 +392,11 @@ void updateDisplay() {
 void setupWebServer() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/setpoint", HTTP_POST, handleSetpointControl);
+  server.on("/pid", HTTP_POST, handlePidControl);
+  server.on("/pid/get", HTTP_GET, handleGetPid);
+  server.on("/pump/mode", HTTP_POST, handlePumpModeControl);
+  server.on("/pump/mode/get", HTTP_GET, handleGetPumpMode);
+  server.on("/pump/manual", HTTP_POST, handleManualPumpControl);
   server.on("/data.json", HTTP_GET, handleDataJson);
   server.on("/download.csv", HTTP_GET, handleDownloadCsv);
   server.onNotFound(handleNotFound);
@@ -365,17 +449,18 @@ void handleRoot() {
       padding: 15px 0;
       border-top: 1px solid #eee;
     }
-    .setpoint-control {
+    .control-group {
       margin-bottom: 15px;
     }
-    .setpoint-control label {
+    .control-group label {
       font-size: 18px;
-      margin-right: 10px;
+      margin: 0 10px;
     }
-    .setpoint-control input[type="range"] {
-      width: 50%;
-      max-width: 300px;
-      vertical-align: middle;
+    .control-group input[type="number"] {
+      width: 80px;
+      font-size: 16px;
+      padding: 5px;
+      text-align: center;
     }
     .button {
       background-color: #4CAF50;
@@ -385,10 +470,16 @@ void handleRoot() {
       text-decoration: none;
       display: inline-block;
       font-size: 16px;
-      margin: 4px 2px;
+      margin-top: 10px;
       cursor: pointer;
       border: none;
       border-radius: 4px;
+    }
+    .pid-controls, .manual-controls {
+        border: 1px solid #ccc;
+        border-radius: 5px;
+        padding: 10px;
+        margin: 10px;
     }
   </style>
 </head>
@@ -399,9 +490,31 @@ void handleRoot() {
       <canvas id="tempChart"></canvas>
     </div>
     <div class="controls-container">
-      <div class="setpoint-control">
-        <label for="setpointSlider">Target Temp: <span id="setpointLabel">78.0</span> &deg;C</label>
-        <input type="range" min="20" max="100" value="78" step="0.1" id="setpointSlider">
+      <div class="control-group">
+        <label>Pump Mode:</label>
+        <input type="radio" id="pumpOff" name="pumpMode" value="0"><label for="pumpOff">Off</label>
+        <input type="radio" id="pumpAuto" name="pumpMode" value="1" checked><label for="pumpAuto">Auto</label>
+        <input type="radio" id="pumpManual" name="pumpMode" value="2"><label for="pumpManual">Manual</label>
+      </div>
+      <div class="pid-controls">
+        <div class="control-group">
+          <label for="setpointInput">Target Temp (&deg;C):</label>
+          <input type="number" min="20" max="100" step="0.1" id="setpointInput">
+        </div>
+        <div class="control-group">
+          <label>Kp:</label>
+          <input type="number" step="0.1" id="kpInput">
+          <label>Ki:</label>
+          <input type="number" step="0.1" id="kiInput">
+          <label>Kd:</label>
+          <input type="number" step="0.1" id="kdInput">
+        </div>
+      </div>
+      <div class="manual-controls">
+        <div class="control-group">
+          <label for="manualPowerInput">Manual Power (%):</label>
+          <input type="number" min="0" max="100" step="1" id="manualPowerInput" value="0">
+        </div>
       </div>
       <a href="/download.csv" class="button">Download Data CSV</a>
     </div>
@@ -428,6 +541,7 @@ void handleRoot() {
           myChart.data.datasets[0].data = data.map(d => d.temp1);
           myChart.data.datasets[1].data = data.map(d => d.temp2);
           myChart.data.datasets[2].data = data.map(d => d.pumpPower);
+          myChart.data.datasets[3].data = data.map(d => d.pressure);
           myChart.update();
         } else {
           // If chart doesn't exist, create it
@@ -454,6 +568,12 @@ void handleRoot() {
                 backgroundColor: 'rgba(75, 192, 192, 0.2)',
                 yAxisID: 'y-power',
                 fill: true
+              }, {
+                label: 'Pressure',
+                data: data.map(d => d.pressure),
+                borderColor: 'rgba(255, 159, 64, 1)',
+                yAxisID: 'y-pressure',
+                fill: false
               }]
             },
             options: {
@@ -475,6 +595,13 @@ void handleRoot() {
                   max: 100,
                   title: { display: true, text: 'Pump Power (%)' },
                   grid: { drawOnChartArea: false }
+                },
+                'y-pressure': {
+                  type: 'linear',
+                  display: true,
+                  position: 'right',
+                  title: { display: true, text: 'Pressure' },
+                  grid: { drawOnChartArea: false }
                 }
               }
             }
@@ -483,29 +610,85 @@ void handleRoot() {
       }).catch(error => console.error('Chart update error:', error));
     };
 
-    // --- Setpoint Control Logic ---
-    const setpointSlider = document.getElementById('setpointSlider');
-    const setpointLabel = document.getElementById('setpointLabel');
+    // --- Control Logic ---
+    const setpointInput = document.getElementById('setpointInput');
+    const kpInput = document.getElementById('kpInput');
+    const kiInput = document.getElementById('kiInput');
+    const kdInput = document.getElementById('kdInput');
+    const manualPowerInput = document.getElementById('manualPowerInput');
+    const pumpModeRadios = document.querySelectorAll('input[name="pumpMode"]');
+    const pidControlsDiv = document.querySelector('.pid-controls');
+    const manualControlsDiv = document.querySelector('.manual-controls');
 
-    setpointSlider.addEventListener('input', (event) => {
-      const temp = parseFloat(event.target.value).toFixed(1);
-      setpointLabel.textContent = temp;
-    });
+    const fetchAndUpdatePidInputs = () => {
+        return fetch('/pid/get')
+            .then(response => response.json())
+            .then(data => {
+                kpInput.value = data.kp;
+                kiInput.value = data.ki;
+                kdInput.value = data.kd;
+            })
+            .catch(error => console.error('Error fetching PID values:', error));
+    };
+    
+    const fetchAndUpdatePumpMode = () => {
+        return fetch('/pump/mode/get')
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('pump' + (data.mode === 0 ? 'Off' : data.mode === 1 ? 'Auto' : 'Manual')).checked = true;
+                toggleControlsVisibility();
+            })
+            .catch(error => console.error('Error fetching pump mode:', error));
+    };
 
-    setpointSlider.addEventListener('change', (event) => {
+    const toggleControlsVisibility = () => {
+        pidControlsDiv.style.display = document.getElementById('pumpAuto').checked ? 'block' : 'none';
+        manualControlsDiv.style.display = document.getElementById('pumpManual').checked ? 'block' : 'none';
+    };
+
+    setpointInput.addEventListener('change', (event) => {
       const temp = event.target.value;
       const formData = new FormData();
       formData.append('target', temp);
+      fetch('/setpoint', { method: 'POST', body: new URLSearchParams(formData) });
+    });
 
-      fetch('/setpoint', {
-        method: 'POST',
-        body: new URLSearchParams(formData)
-      });
+    manualPowerInput.addEventListener('change', (event) => {
+      const power = event.target.value;
+      const formData = new FormData();
+      formData.append('power', power);
+      fetch('/pump/manual', { method: 'POST', body: new URLSearchParams(formData) });
+    });
+
+    const updatePidTunings = () => {
+      const formData = new FormData();
+      formData.append('kp', kpInput.value);
+      formData.append('ki', kiInput.value);
+      formData.append('kd', kdInput.value);
+      fetch('/pid', { method: 'POST', body: new URLSearchParams(formData) });
+    };
+
+    kpInput.addEventListener('change', updatePidTunings);
+    kiInput.addEventListener('change', updatePidTunings);
+    kdInput.addEventListener('change', updatePidTunings);
+
+    pumpModeRadios.forEach(radio => {
+        radio.addEventListener('change', (event) => {
+            const formData = new FormData();
+            formData.append('mode', event.target.value);
+            fetch('/pump/mode', { method: 'POST', body: new URLSearchParams(formData) });
+            toggleControlsVisibility();
+        });
     });
 
     // --- Initial Load ---
-    createOrUpdateChart();
-    setInterval(createOrUpdateChart, 5000); // Refresh chart every 5 seconds
+    document.addEventListener('DOMContentLoaded', (event) => {
+        fetchAndUpdatePidInputs();
+        fetchAndUpdatePumpMode();
+        setpointInput.value = 78.0; // Set default on page load
+        createOrUpdateChart();
+        setInterval(createOrUpdateChart, 5000);
+    });
   </script>
 </body>
 </html>
@@ -530,6 +713,87 @@ void handleSetpointControl() {
   }
 }
 
+/**
+ * @brief Handles POST requests to update the PID tuning parameters.
+ */
+void handlePidControl() {
+  bool updated = false;
+  if (server.hasArg("kp") && server.hasArg("ki") && server.hasArg("kd")) {
+    Kp = server.arg("kp").toDouble();
+    Ki = server.arg("ki").toDouble();
+    Kd = server.arg("kd").toDouble();
+    myPID.SetTunings(Kp, Ki, Kd);
+    
+    myPID.SetMode(MANUAL);
+    myPID.SetMode(AUTOMATIC);
+
+    updated = true;
+    Serial.println("PID Tunings Updated:");
+    Serial.print("Kp: "); Serial.println(Kp);
+    Serial.print("Ki: "); Serial.println(Ki);
+    Serial.print("Kd: "); Serial.println(Kd);
+  }
+  
+  if (updated) {
+    server.send(200, "text/plain", "OK");
+  } else {
+    server.send(400, "text/plain", "Bad Request: Missing PID parameters");
+  }
+}
+
+/**
+ * @brief Handles GET requests for the current PID parameters.
+ */
+void handleGetPid() {
+  String json = "{";
+  json += "\"kp\":" + String(Kp);
+  json += ",\"ki\":" + String(Ki);
+  json += ",\"kd\":" + String(Kd);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+/**
+ * @brief Handles POST requests to update the pump mode.
+ */
+void handlePumpModeControl() {
+  if (server.hasArg("mode")) {
+    int mode = server.arg("mode").toInt();
+    switch(mode) {
+      case 0: currentPumpMode = PUMP_OFF; Serial.println("Pump mode set to OFF"); break;
+      case 1: currentPumpMode = PUMP_AUTO; Serial.println("Pump mode set to AUTO"); break;
+      case 2: currentPumpMode = PUMP_MANUAL; Serial.println("Pump mode set to MANUAL"); break;
+    }
+    server.send(200, "text/plain", "OK");
+  } else {
+    server.send(400, "text/plain", "Bad Request: 'mode' parameter missing");
+  }
+}
+
+/**
+ * @brief Handles GET requests for the current pump mode.
+ */
+void handleGetPumpMode() {
+  String json = "{\"mode\":" + String(currentPumpMode) + "}";
+  server.send(200, "application/json", json);
+}
+
+/**
+ * @brief Handles POST requests to update the manual pump power.
+ */
+void handleManualPumpControl() {
+  if (server.hasArg("power")) {
+    manualPumpPower = server.arg("power").toInt();
+    if (manualPumpPower < 0) manualPumpPower = 0;
+    if (manualPumpPower > 100) manualPumpPower = 100;
+    Serial.print("Manual pump power set to: ");
+    Serial.println(manualPumpPower);
+    server.send(200, "text/plain", "OK");
+  } else {
+    server.send(400, "text/plain", "Bad Request: 'power' parameter missing");
+  }
+}
+
 
 /**
  * @brief Serves the temperature and pump data as a JSON object by streaming it.
@@ -545,6 +809,7 @@ void handleDataJson() {
     json_item += ",\"temp1\":" + String(data[i].temp1);
     json_item += ",\"temp2\":" + String(data[i].temp2);
     json_item += ",\"pumpPower\":" + String(data[i].pumpPower);
+    json_item += ",\"pressure\":" + String(data[i].pressure);
     json_item += "}";
     if (i < readingCount - 1) {
       json_item += ",";
@@ -564,9 +829,9 @@ void handleDownloadCsv() {
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/csv", ""); // Send headers
 
-  server.sendContent("Time,Sensor1_C,Sensor2_C,PumpPower_%\n");
+  server.sendContent("Time,Sensor1_C,Sensor2_C,PumpPower_%,Pressure\n");
   for (int i = 0; i < readingCount; i++) {
-    String row = String(data[i].time) + "," + String(data[i].temp1) + "," + String(data[i].temp2) + "," + String(data[i].pumpPower) + "\n";
+    String row = String(data[i].time) + "," + String(data[i].temp1) + "," + String(data[i].temp2) + "," + String(data[i].pumpPower) + "," + String(data[i].pressure) + "\n";
     server.sendContent(row);
   }
 

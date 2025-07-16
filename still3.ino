@@ -1,5 +1,5 @@
 /*
- * ESP32 Dual DS18B20 Temperature Monitor with Web Server, OTA, and PID Pump Control
+ * OpenStill Controller
  * * This sketch reads temperature from two DS18B20 sensors, pressure from an
  * HX711, displays it on an SSD1306 OLED display, and hosts a web page to 
  * show a graph of the history and control a pump via a PID controller.
@@ -8,6 +8,7 @@
  * - WiFiManager for easy WiFi configuration.
  * - Over-the-Air (OTA) updates for wireless flashing.
  * - PID controller to automatically manage pump power based on a target temperature.
+ * - Time-based pump control for better low-end performance.
  * - Web UI to set target temperature, PID tunings, and pump mode (Off/Auto/Manual).
  * - Reads from DS18B20 temperature sensors and an HX711 pressure sensor.
  * - Compensates for known pressure sensor drift.
@@ -66,6 +67,7 @@
 // --- PWM Configuration ---
 const int PUMP_PWM_FREQ = 5000;
 const int PUMP_PWM_RESOLUTION = 8; // 8-bit resolution (0-255)
+const int PUMP_FIXED_DUTY_CYCLE = 150; // Fixed power level for the pump when on
 
 // --- Pump Control State ---
 enum PumpMode { PUMP_OFF, PUMP_AUTO, PUMP_MANUAL };
@@ -81,7 +83,7 @@ PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, REVERSE);
 
 // --- Sensor Configuration ---
 HX711 scale;
-const float PRESSURE_DRIFT_PER_MINUTE = 0.12;
+const float PRESSURE_DRIFT_PER_MINUTE = 0.0;
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 DeviceAddress sensor1Address, sensor2Address;
@@ -111,6 +113,9 @@ int readingCount = 0;
 // --- Timing ---
 unsigned long lastSensorRead = 0;
 const long sensorReadInterval = 5000; // 5 seconds
+unsigned long pumpCycleStartTime = 0;
+const long pumpCycleInterval = 1000; // 1 second cycle for time-based control
+long pumpOnDuration = 0; // Calculated duration in ms for the pump to be on
 
 // --- Function Prototypes ---
 void setupOTA();
@@ -139,8 +144,8 @@ void setup() {
   ledcWrite(PUMP_PIN, 0); // Start with pump off
 
   // --- Initialize PID Controller ---
-  Setpoint = 78.0; // Default target temperature
-  myPID.SetOutputLimits(0, 255); // PID output will be scaled to PWM duty cycle range
+  Setpoint = 78.2; // Default target temperature
+  myPID.SetOutputLimits(0, pumpCycleInterval); // PID output is mapped to time (0-1000ms)
   myPID.SetMode(AUTOMATIC);
 
   // Initialize display
@@ -225,26 +230,35 @@ void loop() {
   }
 
   // --- Main Pump Control Logic ---
-  int pumpDutyCycle = 0;
   switch(currentPumpMode) {
     case PUMP_AUTO:
       if (readingCount > 0) {
-        Input = data[readingCount-1].temp1; // PID input is the latest temp from sensor 1
+        Input = data[readingCount-1].temp1; // PID input is the latest temp reading
         myPID.Compute();
-        if (Output > 1) { // Leave a small deadband to ensure pump is fully off
-          pumpDutyCycle = map(Output, 1, 255, 80, 255);
-        }
+        pumpOnDuration = Output;
       }
       break;
     case PUMP_MANUAL:
-      pumpDutyCycle = map(manualPumpPower, 0, 100, 0, 255);
+      pumpOnDuration = map(manualPumpPower, 0, 100, 0, pumpCycleInterval);
       break;
     case PUMP_OFF:
     default:
-      pumpDutyCycle = 0; // Off
+      pumpOnDuration = 0; // Off
       break;
   }
-  ledcWrite(PUMP_PIN, pumpDutyCycle);
+  
+  // Time-based pump actuation
+  if (currentMillis - pumpCycleStartTime >= pumpCycleInterval) {
+    pumpCycleStartTime = currentMillis; // Start new cycle
+  }
+
+  if (pumpOnDuration > 0 && (currentMillis - pumpCycleStartTime < pumpOnDuration)) {
+    // We are within the 'on' portion of the cycle
+    ledcWrite(PUMP_PIN, PUMP_FIXED_DUTY_CYCLE); // Run at fixed power
+  } else {
+    // We are in the 'off' portion of the cycle
+    ledcWrite(PUMP_PIN, 0);
+  }
 }
 
 // --- Function Implementations ---
@@ -312,29 +326,17 @@ void readSensors() {
     Serial.println("HX711 not found.");
   }
 
-  // Calculate the actual pump duty cycle
-  int pumpDutyCycle = 0;
-  switch(currentPumpMode) {
-    case PUMP_AUTO:
-      if (Output > 1) {
-        pumpDutyCycle = map(Output, 1, 255, 80, 255);
-      }
-      break;
-    case PUMP_MANUAL:
-      pumpDutyCycle = map(manualPumpPower, 0, 100, 0, 255);
-      break;
-    case PUMP_OFF:
-    default:
-      pumpDutyCycle = 0;
-      break;
-  }
+  // Calculate the actual pump power percentage based on on-time
+  float pumpPowerPercent = (pumpOnDuration / (float)pumpCycleInterval) * 100.0;
+  if (pumpPowerPercent < 0) pumpPowerPercent = 0;
+  if (pumpPowerPercent > 100) pumpPowerPercent = 100;
 
   if (readingCount < MAX_READINGS) {
     data[readingCount].time = millis() / 1000;
     data[readingCount].temp1 = tempC1;
     data[readingCount].temp2 = tempC2;
     data[readingCount].pressure = pressure;
-    data[readingCount].pumpPower = (pumpDutyCycle / 255.0) * 100.0;
+    data[readingCount].pumpPower = pumpPowerPercent;
     readingCount++;
   } else {
     // Shift all data left to make space for the new reading
@@ -345,7 +347,7 @@ void readSensors() {
     data[MAX_READINGS - 1].temp1 = tempC1;
     data[MAX_READINGS - 1].temp2 = tempC2;
     data[MAX_READINGS - 1].pressure = pressure;
-    data[MAX_READINGS - 1].pumpPower = (pumpDutyCycle / 255.0) * 100.0;
+    data[MAX_READINGS - 1].pumpPower = pumpPowerPercent;
   }
   
   Serial.print("S1: "); Serial.print(tempC1); Serial.print("C, S2: "); Serial.print(tempC2); Serial.print("C, Pressure: "); Serial.print(pressure);
@@ -369,15 +371,15 @@ void updateDisplay() {
     display.print("S1: ");
     display.print(data[readingCount-1].temp1, 1);
     display.print("/");
-    display.print(Setpoint, 1);
-    display.println("C");
+    display.println(Setpoint, 1);
 
     display.print("Pump: ");
     display.print(data[readingCount-1].pumpPower, 0);
     display.println("%");
-
+    
     display.print("Pres: ");
-    display.println(data[readingCount-1].pressure, 2);
+    display.println(data[readingCount-1].pressure, 1);
+
   } else {
     display.println("No readings yet.");
   }
@@ -413,7 +415,7 @@ void handleRoot() {
 <!DOCTYPE html>
 <html>
 <head>
-  <title>ESP32 PID Controller</title>
+  <title>OpenStill</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
@@ -428,10 +430,7 @@ void handleRoot() {
       display: flex;
       flex-direction: column;
       height: 100%;
-      max-width: 900px;
-      margin: 0 auto;
       background: white;
-      box-shadow: 0 0 10px rgba(0,0,0,0.1);
     }
     h1 {
       color: #333;
@@ -485,7 +484,7 @@ void handleRoot() {
 </head>
 <body>
   <div class="container">
-    <h1>ESP32 PID Temperature Control</h1>
+    <h1>OpenStill</h1>
     <div id="chart-container">
       <canvas id="tempChart"></canvas>
     </div>
@@ -685,7 +684,7 @@ void handleRoot() {
     document.addEventListener('DOMContentLoaded', (event) => {
         fetchAndUpdatePidInputs();
         fetchAndUpdatePumpMode();
-        setpointInput.value = 78.0; // Set default on page load
+        setpointInput.value = 78.2; // Set default temp target on page load
         createOrUpdateChart();
         setInterval(createOrUpdateChart, 5000);
     });

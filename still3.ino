@@ -10,6 +10,7 @@
  * - PID controller to automatically manage pump power based on a target temperature.
  * - Time-based pump control for better low-end performance.
  * - Web UI to set target temperature, PID tunings, and pump mode (Off/Auto/Manual).
+ * - Web server runs in a dedicated FreeRTOS task for improved responsiveness.
  * - Reads from DS18B20 temperature sensors and an HX711 pressure sensor.
  * - Compensates for known pressure sensor drift.
  * - Stores sensor data in memory.
@@ -83,7 +84,7 @@ PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, REVERSE);
 
 // --- Sensor Configuration ---
 HX711 scale;
-const float PRESSURE_DRIFT_PER_MINUTE = 0.0;
+const float PRESSURE_DRIFT_PER_MINUTE = 0.12;
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 DeviceAddress sensor1Address, sensor2Address;
@@ -118,6 +119,7 @@ const long pumpCycleInterval = 1000; // 1 second cycle for time-based control
 long pumpOnDuration = 0; // Calculated duration in ms for the pump to be on
 
 // --- Function Prototypes ---
+void webServerTask(void *pvParameters);
 void setupOTA();
 void setupWebServer();
 void readSensors();
@@ -213,14 +215,27 @@ void setup() {
   // Setup OTA, Web Server, and initial sensor reading
   setupOTA();
   setupWebServer();
+  
+  // Create a new task for the web server
+  xTaskCreatePinnedToCore(
+      webServerTask,   // Function to implement the task
+      "WebServerTask", // Name of the task
+      4096,            // Stack size in words
+      NULL,            // Task input parameter
+      1,               // Priority of the task
+      NULL,            // Task handle
+      0                // Core where the task should run (0 or 1)
+  );
+
   readSensors(); // Get initial reading
   updateDisplay();
 }
 
 // --- Main Loop ---
+// This loop now only handles sensor reading, PID logic, and pump control.
+// The web server runs independently in its own task.
 void loop() {
-  ArduinoOTA.handle();
-  server.handleClient(); // Handle incoming web server requests
+  ArduinoOTA.handle(); // OTA needs to be handled in the main loop
 
   unsigned long currentMillis = millis();
   if (currentMillis - lastSensorRead >= sensorReadInterval) {
@@ -260,6 +275,17 @@ void loop() {
     ledcWrite(PUMP_PIN, 0);
   }
 }
+
+// --- Web Server Task ---
+// This function runs in a separate task and handles all incoming web requests.
+void webServerTask(void *pvParameters) {
+  (void) pvParameters;
+  for (;;) {
+    server.handleClient();
+    vTaskDelay(10); // Small delay to prevent task from starving other processes
+  }
+}
+
 
 // --- Function Implementations ---
 

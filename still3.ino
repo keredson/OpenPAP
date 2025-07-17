@@ -11,6 +11,7 @@
  * - Time-based pump control for better low-end performance.
  * - Web UI to set target temperature, PID tunings, and pump mode (Off/Auto/Manual).
  * - Web server runs in a dedicated FreeRTOS task for improved responsiveness.
+ * - Efficient web updates: full history on load, single-point updates thereafter.
  * - Reads from DS18B20 temperature sensors and an HX711 pressure sensor.
  * - Compensates for known pressure sensor drift.
  * - Stores sensor data in memory.
@@ -132,6 +133,7 @@ void handlePumpModeControl();
 void handleGetPumpMode();
 void handleManualPumpControl();
 void handleDataJson();
+void handleDataUpdate();
 void handleDownloadCsv();
 void handleNotFound();
 String getSensorAddressString(DeviceAddress deviceAddress);
@@ -426,6 +428,7 @@ void setupWebServer() {
   server.on("/pump/mode/get", HTTP_GET, handleGetPumpMode);
   server.on("/pump/manual", HTTP_POST, handleManualPumpControl);
   server.on("/data.json", HTTP_GET, handleDataJson);
+  server.on("/data/update", HTTP_GET, handleDataUpdate);
   server.on("/download.csv", HTTP_GET, handleDownloadCsv);
   server.onNotFound(handleNotFound);
 
@@ -546,93 +549,106 @@ void handleRoot() {
   </div>
   <script>
     let myChart; // Variable to hold the chart instance
+    const MAX_CHART_POINTS = 3000;
 
-    const fetchData = () => {
-      return fetch('/data.json').then(response => response.json());
+    const initialChartLoad = () => {
+      fetch('/data.json')
+        .then(response => response.json())
+        .then(data => createChart(data))
+        .catch(error => console.error('Initial chart load error:', error));
     };
 
-    const createOrUpdateChart = () => {
-      fetchData().then(data => {
-        const ctx = document.getElementById('tempChart').getContext('2d');
-        
-        const labels = data.map(d => {
-          const date = new Date(d.time * 1000);
-          return date.toLocaleTimeString();
-        });
+    const updateChart = () => {
+        fetch('/data/update')
+            .then(response => response.json())
+            .then(point => {
+                if (!myChart || !point.time) return; // Don't update if chart not ready or no new data
 
-        if (myChart) {
-          // If chart exists, update data and redraw
-          myChart.data.labels = labels;
-          myChart.data.datasets[0].data = data.map(d => d.temp1);
-          myChart.data.datasets[1].data = data.map(d => d.temp2);
-          myChart.data.datasets[2].data = data.map(d => d.pumpPower);
-          myChart.data.datasets[3].data = data.map(d => d.pressure);
-          myChart.update();
-        } else {
-          // If chart doesn't exist, create it
-          myChart = new Chart(ctx, {
-            type: 'line',
-            data: {
-              labels: labels,
-              datasets: [{
-                label: 'Sensor 1 (°C)',
-                data: data.map(d => d.temp1),
-                borderColor: 'rgba(255, 99, 132, 1)',
-                yAxisID: 'y-temp',
-                fill: false
-              }, {
-                label: 'Sensor 2 (°C)',
-                data: data.map(d => d.temp2),
-                borderColor: 'rgba(54, 162, 235, 1)',
-                yAxisID: 'y-temp',
-                fill: false
-              }, {
-                label: 'Pump Power (%)',
-                data: data.map(d => d.pumpPower),
-                borderColor: 'rgba(75, 192, 192, 1)',
-                backgroundColor: 'rgba(75, 192, 192, 0.2)',
-                yAxisID: 'y-power',
-                fill: true
-              }, {
-                label: 'Pressure',
-                data: data.map(d => d.pressure),
-                borderColor: 'rgba(255, 159, 64, 1)',
-                yAxisID: 'y-pressure',
-                fill: false
-              }]
-            },
-            options: {
-              responsive: true,
-              maintainAspectRatio: false,
-              scales: {
-                x: { display: true, title: { display: true, text: 'Time' } },
-                'y-temp': {
-                  type: 'linear',
-                  display: true,
-                  position: 'left',
-                  title: { display: true, text: 'Temperature (°C)' }
-                },
-                'y-power': {
-                  type: 'linear',
-                  display: true,
-                  position: 'right',
-                  min: 0,
-                  max: 100,
-                  title: { display: true, text: 'Pump Power (%)' },
-                  grid: { drawOnChartArea: false }
-                },
-                'y-pressure': {
-                  type: 'linear',
-                  display: true,
-                  position: 'right',
-                  title: { display: true, text: 'Pressure' },
-                  grid: { drawOnChartArea: false }
+                const newLabel = new Date(point.time * 1000).toLocaleTimeString();
+                myChart.data.labels.push(newLabel);
+                myChart.data.datasets[0].data.push(point.temp1);
+                myChart.data.datasets[1].data.push(point.temp2);
+                myChart.data.datasets[2].data.push(point.pumpPower);
+                myChart.data.datasets[3].data.push(point.pressure);
+
+                // Remove oldest data point if we're over the max
+                if (myChart.data.labels.length > MAX_CHART_POINTS) {
+                    myChart.data.labels.shift();
+                    myChart.data.datasets.forEach((dataset) => {
+                        dataset.data.shift();
+                    });
                 }
-              }
+
+                myChart.update();
+            })
+            .catch(error => console.error('Chart update error:', error));
+    };
+
+    const createChart = (data) => {
+      const ctx = document.getElementById('tempChart').getContext('2d');
+      const labels = data.map(d => new Date(d.time * 1000).toLocaleTimeString());
+      
+      myChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: labels,
+          datasets: [{
+            label: 'Sensor 1 (°C)',
+            data: data.map(d => d.temp1),
+            borderColor: 'rgba(255, 99, 132, 1)',
+            yAxisID: 'y-temp',
+            fill: false
+          }, {
+            label: 'Sensor 2 (°C)',
+            data: data.map(d => d.temp2),
+            borderColor: 'rgba(54, 162, 235, 1)',
+            yAxisID: 'y-temp',
+            fill: false
+          }, {
+            label: 'Pump Power (%)',
+            data: data.map(d => d.pumpPower),
+            borderColor: 'rgba(75, 192, 192, 1)',
+            backgroundColor: 'rgba(75, 192, 192, 0.2)',
+            yAxisID: 'y-power',
+            fill: true
+          }, {
+            label: 'Pressure',
+            data: data.map(d => d.pressure),
+            borderColor: 'rgba(255, 159, 64, 1)',
+            yAxisID: 'y-pressure',
+            fill: false
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          scales: {
+            x: { display: true, title: { display: true, text: 'Time' } },
+            'y-temp': {
+              type: 'linear',
+              display: true,
+              position: 'left',
+              title: { display: true, text: 'Temperature (°C)' }
+            },
+            'y-power': {
+              type: 'linear',
+              display: true,
+              position: 'right',
+              min: 0,
+              max: 100,
+              title: { display: true, text: 'Pump Power (%)' },
+              grid: { drawOnChartArea: false }
+            },
+            'y-pressure': {
+              type: 'linear',
+              display: true,
+              position: 'right',
+              title: { display: true, text: 'Pressure' },
+              grid: { drawOnChartArea: false }
             }
-          });
+          }
         }
-      }).catch(error => console.error('Chart update error:', error));
+      });
     };
 
     // --- Control Logic ---
@@ -711,8 +727,8 @@ void handleRoot() {
         fetchAndUpdatePidInputs();
         fetchAndUpdatePumpMode();
         setpointInput.value = 78.2; // Set default temp target on page load
-        createOrUpdateChart();
-        setInterval(createOrUpdateChart, 5000);
+        initialChartLoad();
+        setInterval(updateChart, 5000);
     });
   </script>
 </body>
@@ -844,6 +860,24 @@ void handleDataJson() {
   server.sendContent("]");
   
   server.sendContent(""); // End of stream
+}
+
+/**
+ * @brief Serves the latest data point as a JSON object.
+ */
+void handleDataUpdate() {
+  if (readingCount > 0) {
+    String json_item = "{";
+    json_item += "\"time\":" + String(data[readingCount - 1].time);
+    json_item += ",\"temp1\":" + String(data[readingCount - 1].temp1);
+    json_item += ",\"temp2\":" + String(data[readingCount - 1].temp2);
+    json_item += ",\"pumpPower\":" + String(data[readingCount - 1].pumpPower);
+    json_item += ",\"pressure\":" + String(data[readingCount - 1].pressure);
+    json_item += "}";
+    server.send(200, "application/json", json_item);
+  } else {
+    server.send(200, "application/json", "{}"); // Send empty object if no data yet
+  }
 }
 
 /**
